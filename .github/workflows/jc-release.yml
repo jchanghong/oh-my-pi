@@ -1,0 +1,108 @@
+name: JC release build
+
+on:
+  push:
+    branches:
+      - build/release-17.4.0
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Bun and dependencies
+        uses: ./.github/actions/bun-install
+
+      - name: Read OMP native version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./packages/natives/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          test "$version" = "17.4.0"
+
+      - name: Fetch official prebuilt native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          tmp="$(mktemp -d)"
+          mkdir -p packages/natives/native
+
+          for pkg in \
+            "@oh-my-pi/pi-natives-linux-x64@$version" \
+            "@oh-my-pi/pi-natives-win32-x64@$version"; do
+            tarball="$(npm view "$pkg" dist.tarball)"
+            echo "Fetching $pkg"
+            sub="$tmp/$(echo "$pkg" | tr '/@' '__')"
+            mkdir -p "$sub"
+            curl -fsSL --retry 3 "$tarball" | tar -xz -C "$sub"
+            cp "$sub"/package/*.node packages/natives/native/
+          done
+
+          ls -lh packages/natives/native/*.node
+          test -f packages/natives/native/pi_natives.linux-x64-baseline.node
+          test -f packages/natives/native/pi_natives.linux-x64-modern.node
+          test -f packages/natives/native/pi_natives.win32-x64-baseline.node
+
+      - name: Build Linux x64 and Windows x64
+        env:
+          RELEASE_TARGETS: linux-x64,win32-x64
+        run: bun run ci:release:build-binaries
+
+      - name: Smoke test Linux binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x packages/coding-agent/binaries/omp-linux-x64
+          runtime_dir="$(mktemp -d)"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" \
+            packages/coding-agent/binaries/omp-linux-x64 --smoke-test
+
+      - name: Validate Windows artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s packages/coding-agent/binaries/omp-windows-x64.exe
+          file packages/coding-agent/binaries/omp-windows-x64.exe | tee windows-file.txt
+          grep -qi 'PE32' windows-file.txt
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd packages/coding-agent/binaries
+          sha256sum omp-linux-x64 omp-windows-x64.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: omp-17.4.0-jc1
+          path: |
+            packages/coding-agent/binaries/omp-linux-x64
+            packages/coding-agent/binaries/omp-windows-x64.exe
+            packages/coding-agent/binaries/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/build/release-17.4.0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v17.4.0-jc1
+          target_commitish: ${{ github.sha }}
+          name: OMP 17.4.0 jc1
+          body: |
+            Repack of upstream OMP 17.4.0 from this fork without business-code changes.
+            Rust native addons are the official @oh-my-pi/pi-natives 17.4.0 Linux x64 and Windows x64 packages.
+          files: |
+            packages/coding-agent/binaries/omp-linux-x64
+            packages/coding-agent/binaries/omp-windows-x64.exe
+            packages/coding-agent/binaries/SHA256SUMS.txt
